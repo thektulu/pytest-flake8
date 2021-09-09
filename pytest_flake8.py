@@ -21,6 +21,9 @@ def pytest_addoption(parser):
     group.addoption(
         '--flake8', action='store_true',
         help="perform some flake8 sanity checks on .py files")
+    group.addoption(
+        '--flake8-fast', action='store_true',
+        help="same as --flake8 but aggregates all files to single check for much better performance")
     parser.addini(
         "flake8-ignore", type="linelist",
         help="each line specifies a glob pattern and whitespace "
@@ -45,7 +48,7 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     """Start a new session."""
-    if config.option.flake8:
+    if config.option.flake8 or config.option.flake8_fast:
         config._flake8ignore = Ignorer(config.getini("flake8-ignore"))
         config._flake8maxlen = config.getini("flake8-max-line-length")
         config._flake8maxcomplexity = config.getini("flake8-max-complexity")
@@ -60,7 +63,7 @@ def pytest_configure(config):
 def pytest_collect_file(path, parent):
     """Filter files down to which ones should be checked."""
     config = parent.config
-    if config.option.flake8 and path.ext in config._flake8exts:
+    if (config.option.flake8 or config.option.flake8_fast) and path.ext in config._flake8exts:
         flake8ignore = config._flake8ignore(path)
         if flake8ignore is not None:
             if hasattr(Flake8Item, "from_parent"):
@@ -80,6 +83,55 @@ def pytest_collect_file(path, parent):
                     maxcomplexity=config._flake8maxcomplexity,
                     showshource=config._flake8showshource,
                     statistics=config._flake8statistics)
+
+
+def find_top_parent(item):
+    curr = item
+    while True:
+        if hasattr(curr, 'parent') and curr.parent:
+            curr = curr.parent
+        else:
+            return curr
+
+
+def pytest_collection_modifyitems(config, items):
+    if config.option.flake8_fast:
+        other_items = []
+        deselected_items = []
+        fspaths = []
+        parent = None
+        for item in items:
+            if not isinstance(item, Flake8Item):
+                other_items.append(item)
+            else:
+                deselected_items.append(item)
+                fspaths.append(item.fspath)
+                if parent is None:
+                    parent = find_top_parent(item)
+        if fspaths:
+            flake8ignore = config._flake8ignore('__flake8__')
+            if flake8ignore is not None:
+                if hasattr(Flake8FileCollectionItem, "from_parent"):
+                    collection_item = Flake8FileCollectionItem.from_parent(parent, name='__flake8__')
+                    collection_item.fspaths = fspaths
+                    collection_item.flake8ignore = flake8ignore
+                    collection_item.maxlength = config._flake8maxlen
+                    collection_item.maxcomplexity = config._flake8maxcomplexity
+                    collection_item.showshource = config._flake8showshource
+                    collection_item.statistics = config._flake8statistics
+                else:
+                    collection_item = Flake8FileCollectionItem(
+                        '__flake8__',
+                        parent,
+                        fspaths=fspaths,
+                        flake8ignore=flake8ignore,
+                        maxlength=config._flake8maxlen,
+                        maxcomplexity=config._flake8maxcomplexity,
+                        showshource=config._flake8showshource,
+                        statistics=config._flake8statistics
+                    )
+            config.hook.pytest_deselected(items=deselected_items)
+            items[:] = [collection_item] + other_items
 
 
 def pytest_unconfigure(config):
@@ -118,8 +170,8 @@ class Flake8Item(pytest.Item, pytest.File):
     def runtest(self):
         call = py.io.StdCapture.call
         found_errors, out, err = call(
-            check_file,
-            self.fspath,
+            check_files,
+            [self.fspath],
             self.flake8ignore,
             self.maxlength,
             self.maxcomplexity,
@@ -132,6 +184,71 @@ class Flake8Item(pytest.Item, pytest.File):
         if hasattr(self.config, "_flake8mtimes"):
             self.config._flake8mtimes[str(self.fspath)] = (self._flake8mtime,
                                                            self.flake8ignore)
+
+    def repr_failure(self, excinfo):
+        if excinfo.errisinstance(Flake8Error):
+            return excinfo.value.args[0]
+        return super(Flake8Item, self).repr_failure(excinfo)
+
+    def reportinfo(self):
+        if self.flake8ignore:
+            ignores = "(ignoring %s)" % " ".join(self.flake8ignore)
+        else:
+            ignores = ""
+        return (self.fspath, -1, "FLAKE8-check%s" % ignores)
+
+    def collect(self):
+        return iter((self,))
+
+
+class Flake8FileCollectionItem(pytest.Item):
+    def __init__(self, name, parent, fspaths=None, flake8ignore=None, maxlength=None,
+                 maxcomplexity=None, showshource=None, statistics=None):
+        super(Flake8FileCollectionItem, self).__init__(name=name, parent=parent)
+        self.add_marker("flake8")
+        self.fspaths = fspaths
+        self.filtered_fspaths = tuple()
+        self.flake8ignore = flake8ignore
+        self.maxlength = maxlength
+        self.maxcomplexity = maxcomplexity
+        self.showshource = showshource
+        self.statistics = statistics
+
+    def setup(self):
+        if hasattr(self.config, "_flake8mtimes"):
+            flake8mtimes = self.config._flake8mtimes
+        else:
+            flake8mtimes = {}
+        self._flake8mtimes = {}
+        self.filtered_fspaths = []
+        for fspath in self.fspaths:
+            flake8mtime = fspath.mtime()
+            self._flake8mtimes[str(fspath)] = flake8mtime
+            old = flake8mtimes.get(str(fspath), (0, []))
+            if old == [flake8mtime, self.flake8ignore]:
+                continue
+            self.filtered_fspaths.append(fspath)
+
+    def runtest(self):
+        call = py.io.StdCapture.call
+        found_errors, out, err = call(
+            check_files,
+            self.filtered_fspaths,
+            self.flake8ignore,
+            self.maxlength,
+            self.maxcomplexity,
+            self.showshource,
+            self.statistics)
+        if found_errors:
+            raise Flake8Error(out, err)
+        # update mtime only if test passed
+        # otherwise failures would not be re-run next time
+        if hasattr(self.config, "_flake8mtimes"):
+            for fspath in self.filtered_fspaths:
+                self.config._flake8mtimes[str(fspath)] = (
+                    self._flake8mtimes[str(fspath)],
+                    self.flake8ignore,
+                )
 
     def repr_failure(self, excinfo):
         if excinfo.errisinstance(Flake8Error):
@@ -179,8 +296,8 @@ class Ignorer:
         return l
 
 
-def check_file(path, flake8ignore, maxlength, maxcomplexity,
-               showshource, statistics):
+def check_files(paths, flake8ignore, maxlength, maxcomplexity,
+                showshource, statistics):
     """Run flake8 over a single file, and return the number of failures."""
     args = []
     if maxlength:
@@ -217,7 +334,7 @@ def check_file(path, flake8ignore, maxlength, maxcomplexity,
         app.make_notifier()
     app.make_guide()
     app.make_file_checker_manager()
-    app.run_checks([str(path)])
+    app.run_checks(list(map(str, paths)))
     app.formatter.start()
     app.report_errors()
     app.formatter.stop()
